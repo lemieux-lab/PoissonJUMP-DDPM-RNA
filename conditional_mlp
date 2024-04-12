@@ -1,0 +1,318 @@
+import Pkg
+Pkg.activate("/home/golem/scratch/munozc/Julia-try/pair_prog/")
+using Flux
+
+include("time_embeddings.jl")
+
+mutable struct Conditional_layer
+    activation
+    in_norm     :: Flux.LayerNorm
+    in_fc       :: Flux.Dense
+    out_norm    :: Flux.LayerNorm
+    out_fc      :: Flux.Dense
+    proj        :: Flux.Dense
+    #dropout     :: Flux.Dropout
+end
+
+#identity([2])
+function Conditional_layer(in_dim, out_dim, temb_dim)
+    #in_dim = param_dict["in_dim"]
+    #out_dim = param_dict["out_dim"]
+
+    activation(x) = leakyrelu(x, 0.02)
+    #activation(x) = relu(x)
+    
+    #activation(x) = identity(x)
+
+    #FIXME: this layer norm is causing NaN gradients
+    in_norm  = Flux.LayerNorm(in_dim, activation)
+
+    in_fc    = Flux.Dense(in_dim => out_dim)
+    out_norm = Flux.LayerNorm(out_dim, activation)
+
+    out_fc   = Flux.Dense(out_dim => out_dim)
+    proj     = Flux.Dense(temb_dim => out_dim)
+    return Conditional_layer(activation, in_norm, in_fc, out_norm, out_fc, proj)
+end
+
+#akyrelu(3, 0.002)
+
+#model = Conditional_layer(4,16,3)
+
+# FIXME: activations are used wierd...
+@Flux.functor(Conditional_layer)
+function (cl::Conditional_layer)(x, t_emb)
+    #out = cl.in_fc(cl.in_norm(x))
+    #out = out .+ cl.proj(cl.activation(t_emb))
+    #out = cl.out_fc(cl.out_norm(out))
+#println(size(x))
+#sprintln(size(t_emb))
+    
+    out = cl.in_fc(x)
+    out = out .+ cl.proj(cl.activation(t_emb))
+    out = cl.out_fc(cl.out_norm(out))
+    return cl.activation(out)
+end
+
+struct Conditional_MLP
+    base_dim :: Int
+    temb_dim :: Int
+
+    drop :: Flux.Dropout
+    
+    embed :: Flux.Chain
+
+    #in_sc :: Flux.Scale
+    in_fc  :: Flux.Dense
+    layers
+    out_fc :: Flux.Dense
+end
+
+#Flux.Dense(2=>3)
+
+
+function Conditional_MLP(param_dict)
+    """
+    in_dim=1,
+    base_dim=64,
+    out_dim=None,
+    multiplier=1,
+    temb_dim=None,
+    num_layers=3,
+    drop_rate=0.,
+    continuous_t=False
+    """
+    
+    in_dim = param_dict["in_dim"]
+    base_dim = param_dict["base_dim"]
+
+    drop = Flux.Dropout(0.5)
+
+    temb_dim = param_dict["base_dim"]
+    out_dim = param_dict["in_dim"]
+
+    num_layers = 5
+
+    activation(x) = leakyrelu(x, 0.02)
+    #activation(x) = relu(x)
+
+    embed = Flux.Chain(Flux.Dense(base_dim => temb_dim, activation), Flux.Dense(temb_dim => temb_dim))
+    #embed = Flux.Chain(Flux.Dense(base_dim => temb_dim))
+
+    in_sc = Flux.Scale(in_dim, )
+    in_fc = Flux.Dense(in_dim => base_dim)
+    test = [base_dim for i in 1:num_layers+1]#div(base_dim,2),div(base_dim,4),div(base_dim,2),base_dim]
+    layers = gpu.([Conditional_layer(test[r], test[r+1], temb_dim) for r in 1:num_layers])
+    """
+    layers= SkipConnection(
+            Flux.Chain(Conditional_layer(base_dim, div(base_dim,2), temb_dim),
+                SkipConnection(
+                    Flux.Chain(Conditional_layer(div(base_dim,2), div(base_dim,4), temb_dim),
+                    Conditional_layer(div(base_dim,4), div(base_dim,2), temb_dim)),
+                +),
+            Conditional_layer(div(base_dim,2), base_dim, temb_dim)),
+            +)
+    """
+    #### FIXME:  NORMAL HERE
+    #layers = [Conditional_layer(base_dim, base_dim, temb_dim) for _ in 1:num_layers]
+    
+    
+    #layers = Conditional_layer(base_dim, base_dim, temb_dim)
+     
+    #activation before out_fc
+    out_fc = Flux.Dense(base_dim => out_dim)
+
+    return Conditional_MLP(base_dim, temb_dim, drop, embed, in_fc, layers, out_fc)
+end
+
+#TODO: check dimensions are correct.
+
+@Flux.functor(Conditional_MLP)
+function (cl::Conditional_MLP)(x, t)
+    t_emb = gpu(timestep_embedding(t,cl.base_dim))
+    t_emb = cl.embed(t_emb')
+
+    #x = cl.in_sc(x)
+    #out=cl.in_fc(cl.drop(x))
+    out = cl.in_fc(x)       # in -> 1000
+    #out_1 = cl.layers[1](out, t_emb)    # 1000 -> 500
+    #out_2 = cl.layers[2](out_1, t_emb)    # 500 -> 250
+
+    #out_3 = cl.layers[3](out_2, t_emb) #.+ out_1      # 250 -> 500 (+ 500)
+    #out_4 = cl.layers[4](out_3, t_emb) #.+ out
+    #out= cl.layers(out)
+    for layer in cl.layers
+        out = layer(out, t_emb)
+    end
+    out = leakyrelu.(out, 0.02)
+
+    out = cl.out_fc(out)
+
+    #out = relu(out .+ x)
+    out = softplus(out .+ x)
+    #out = out .+ x
+    return out
+
+end
+
+struct Conditional_MLP_2
+    base_dim :: Int
+    temb_dim :: Int
+
+    embed :: Flux.Chain
+
+    in_sc :: Flux.Scale
+    in_fc  :: Flux.Dense
+    layers
+    out_fc :: Flux.Dense
+end
+
+#Flux.Dense(2=>3)
+
+
+function Conditional_MLP_2(param_dict)
+    """
+    in_dim=1,
+    base_dim=64,
+    out_dim=None,
+    multiplier=1,
+    temb_dim=None,
+    num_layers=3,
+    drop_rate=0.,
+    continuous_t=False
+    """
+    
+    in_dim = param_dict["in_dim"]
+    base_dim = param_dict["base_dim"]
+    temb_dim = param_dict["base_dim"]
+    out_dim = param_dict["in_dim"]
+
+    num_layers = 4
+
+    activation(x) = leakyrelu(x, 0.02)
+    #activation(x) = relu(x)
+
+    embed = Flux.Chain(Flux.Dense(base_dim => temb_dim, activation), Flux.Dense(temb_dim => temb_dim))
+    #embed = Flux.Chain(Flux.Dense(base_dim => temb_dim))
+
+    in_sc = Flux.Scale(in_dim, )
+    in_fc = Flux.Dense(in_dim => base_dim)
+    test = [base_dim,base_dim,base_dim]#div(base_dim,2),div(base_dim,4),div(base_dim,2),base_dim]
+    layers = [Conditional_layer(test[r], test[r+1], temb_dim) for r in 1:num_layers]
+    """
+    layers= SkipConnection(
+            Flux.Chain(Conditional_layer(base_dim, div(base_dim,2), temb_dim),
+                SkipConnection(
+                    Flux.Chain(Conditional_layer(div(base_dim,2), div(base_dim,4), temb_dim),
+                    Conditional_layer(div(base_dim,4), div(base_dim,2), temb_dim)),
+                +),
+            Conditional_layer(div(base_dim,2), base_dim, temb_dim)),
+            +)
+    """
+    #### FIXME:  NORMAL HERE
+    #layers = [Conditional_layer(base_dim, base_dim, temb_dim) for _ in 1:num_layers]
+    
+    
+    #layers = Conditional_layer(base_dim, base_dim, temb_dim)
+     
+    #activation before out_fc
+    out_fc = Flux.Dense(base_dim => out_dim)
+
+    return Conditional_MLP_2(base_dim, temb_dim, embed, in_sc, in_fc, layers, out_fc)
+end
+
+#TODO: check dimensions are correct.
+
+@Flux.functor(Conditional_MLP_2)
+function (cl::Conditional_MLP_2)(x, t)
+    t_emb = timestep_embedding(t,cl.base_dim)
+    t_emb = cl.embed(t_emb')
+
+    x = cl.in_sc(x)
+    out=cl.in_fc(x)
+    #out = cl.in_fc(x)       # in -> 1000
+    #out_1 = cl.layers[1](out, t_emb)    # 1000 -> 500
+    #out_2 = cl.layers[2](out_1, t_emb)    # 500 -> 250
+
+    #out_3 = cl.layers[3](out_2, t_emb) #.+ out_1      # 250 -> 500 (+ 500)
+    #out_4 = cl.layers[4](out_3, t_emb) #.+ out
+    #out= cl.layers(out)
+    for layer in cl.layers
+       out = layer(out, t_emb)
+    end
+    out = leakyrelu.(out, 0.02)
+
+    out = cl.out_fc(out)
+
+    out = relu(out .+ x)
+    #out = softplus(out)
+    return out
+
+end
+
+
+
+struct easyParallel3
+    para     :: Flux.Dense
+    fc1      :: Flux.Dense
+end
+
+function easyParallel3()
+     para = Dense(38662 => 1000)
+     fc1 = Dense(1000 => 38662)
+     return easyParallel3(para,fc1)
+end
+
+@Flux.functor(easyParallel3)
+function (ep::easyParallel3)(x, t)
+    out = ep.para(x)
+    println(size(out))
+    ts = timestep_embedding(t, 1000)
+    println(size(ts))
+    out = ep.fc1(out.+ts')
+end
+
+#in_dim = size(data_matrix_noz)[2]
+
+#model = Conditional_MLP(Dict("in_dim" => in_dim, "base_dim" => 128))
+
+
+#model(data_matrix_noz, rand(1:1000, 300))
+
+
+#########
+# TODO: simple MLP
+
+# FIXME: sin embedding then learned embedding? Hmmm...
+"""
+In the case of univariate and document datasets, we employ a MLP composed
+of three blocks. 
+Each block consists of two fully-connected layers and one time embedding projection layer. 
+Intermediate layers use Leaky-ReLU activation along with layer normalization.
+
+"""
+
+"""
+class ConditionalLayer(nn.Module):
+    def __init__(self, in_dim, out_dim, temb_dim, drop_rate=0.):
+        super().__init__()
+        self.act = NONLINEARITY()
+        self.in_norm = NORMALIZER(in_dim)
+        self.in_fc = Linear(in_dim, out_dim)
+        self.out_norm = NORMALIZER(out_dim)
+        self.out_fc = Linear(out_dim, out_dim)
+        self.proj = Linear(temb_dim, out_dim)
+        self.dropout = nn.Dropout1d(drop_rate) if drop_rate else nn.Identity()
+
+    def forward(self, x, t_emb=None):
+        out = self.in_fc(self.act(self.in_norm(x)))
+        if t_emb is not None:
+            out = out + self.proj(self.act(t_emb))
+        return self.out_fc(self.dropout(self.act(self.out_norm(out))))
+
+full:
+out = self.in_fc(x)
+for layer in self.layers:
+    out = layer(out, t_emb)
+return self.out_fc(out)
+"""
