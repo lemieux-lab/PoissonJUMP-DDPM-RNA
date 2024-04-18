@@ -1,7 +1,3 @@
-import Pkg
-Pkg.activate("/home/golem/scratch/munozc/Julia-try/pair_prog/")
-using Flux
-
 include("time_embeddings.jl")
 
 
@@ -92,7 +88,7 @@ function Conditional_MLP(param_dict)
     return Conditional_MLP(base_dim, temb_dim, drop, embed, in_fc, layers, out_fc)
 end
 
-#! FIXME: remove hardcoding
+
 @Flux.functor(Conditional_MLP)
 function (cl::Conditional_MLP)(x, t)
     t_emb = gpu(timestep_embedding(t,cl.base_dim))
