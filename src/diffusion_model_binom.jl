@@ -2,19 +2,9 @@
 
 import Pkg
 Pkg.activate("src/.")
-
-
-using Random
-using Distributions
-using StatsBase
-using Statistics
-using Flux
-include("conditional_mlp")
+include("utils_DDPM.jl")
+include("conditional_mlp.jl")
 include("samplings.jl")
-
-
-using Printf
-using ProgressBars
 
 
 function linear_beta_schedule(num_timesteps::Int, β_start=0.0001f0, β_end=0.02f0)
@@ -58,42 +48,39 @@ function l2_penalty(model)
 end
 
 # Train one fold
-function train_fold_binom(data; lmb=10, T=500, 
-                                mode="binomial", time_choice="random", 
-                                model_type="DDPM", n_epochs=2, 
-                                batch_size=32, test_size=100, lr=0.0001)
+# NOTE: this code will require a GPU
+function train_fold_binom(data; lmb=10, t_fixed=500, mode="binomial", time_choice="random", 
+    model_type="DDPM", loss_name="huber", n_epochs=2, test_size=32, batch_size=32)
+
     n_samples = size(data)[1]
     in_dim = size(data)[2]
-    #! Make sure to assign device (gpu/cpu)
+
     data_ori = data
     data = Float32.(log10.(data.+1))
+    data_scale = data
 
     shuffled_ids = shuffle(collect(1:n_samples))
     test_ids = shuffled_ids[1:test_size]
     train_ids = shuffled_ids[test_size+1:end]
+
     n_batches = Int(ceil(length(train_ids)/batch_size))
 
-    t_fixed = T
+    opt = ADAM(1e-4)
+    loss = choose_loss(loss_name, time_choice)
 
-    opt = ADAM(lr)
-    
+    model = gpu(choose_model(model_type, in_dim))
 
-    #! Possible loss functions that can be used
-    #loss(model, x, q, timesteps) = Flux.Losses.mse(gpu(deltas[timesteps]').*model(gpu(q'), timesteps'), gpu(deltas[timesteps]'.*x'))  #+ 1e-3*l2_penalty(model)
-    #loss(model, x, q, timesteps) = Flux.Losses.huber_loss(gpu(deltas[timesteps]').*model(gpu(q'), timesteps'), gpu(deltas[timesteps]'.*x'))  #+ 1e-3*l2_penalty(model)
-    loss(model, x, q, timesteps) =  mean(poisson_kl(gpu(deltas[timesteps] .* x), gpu(deltas[timesteps]) .* model(gpu(q'), timesteps')')) #+ 1e-4*l2_penalty(model)
 
-    #! WARNING: the gpu is hard coded at the moment. This will need to be fixed.
-    model = gpu(Conditional_MLP(Dict("in_dim" => in_dim, "base_dim" => 2000)))
 
     train_x = data[train_ids, :]
     test_x_ori  = data_ori[test_ids, :]
-    test_x  = log10.(test_x_ori .+1 )
+    test_x = log10.(test_x_ori .+1 )
 
     train_loss = []
     test_loss  = []
 
-    for e in 1:n_epochs
+
+    for e in ProgressBar(1:n_epochs)
         epoch_shuffle=shuffle(train_ids)
 
         for b in 1:n_batches
@@ -105,52 +92,63 @@ function train_fold_binom(data; lmb=10, T=500,
             end   
 
             batch_x = data[batch_idx, :]
+            batch_x_scale = data_scale[batch_idx, :]
 
+            # If we have a model training for all coverages or only a specific coverage
             if time_choice == "random"
+                # Selects a random t for all samples in batch
                 timesteps = reshape(rand(1:t_fixed, length(batch_idx)), :, 1)
                 timesteps_test = reshape(rand(1:t_fixed, length(test_ids)), :, 1)
 
+            elseif time_choice == "batch_random"
+                # Selects the same random t for all samples in batch 
+                timesteps = reshape(repeat(rand(1:t_fixed, 1), length(batch_idx)), :, 1)
+                timesteps_test = reshape(repeat(rand(1:t_fixed, 1), length(test_ids)), :, 1)
+
             elseif time_choice == "fixed"
+                # Awlays selects the t_fixed for t
                 timesteps = reshape(repeat([t_fixed], length(batch_idx)), :, 1)
                 timesteps_test = reshape(repeat([t_fixed], length(test_ids)), :, 1)
-
             end
- 
+            alphas_t = alphas[timesteps]
+            alphas_t_test = alphas[timesteps_test]
+
+            # Allowing for discrete or continuous sampling
             if mode=="poisson"
-                Q = log10.(q_sample(data_ori[batch_idx,:], timesteps, alphas) .+1 ) 
-                Q_test = log10.(q_sample(test_x_ori, timesteps_test, alphas) .+1 ) 
+                Q = log10.(q_sample(data_ori[batch_idx,:], timesteps, alphas) .+1 )
+                Q_test = log10.(q_sample(test_x_ori, timesteps_test, alphas)  .+1 )
 
-            else
-                Q = log10.(q_sample_binom(data_ori[batch_idx,:], alphas[timesteps], alphas) .+1 )
-                Q_test = log10.(q_sample_binom(test_x, alphas[timesteps_test], alphas) .+1 )
+            else mode=="binom"
+                Q = log10.(q_sample_binom(data_ori[batch_idx,:], alphas[timesteps]) .+1 )
+                Q_test = log10.(q_sample_binom(test_x_ori, alphas[timesteps_test]) .+1 )
             end
 
-            train_l_tmp = gradient_step(batch_x, Q, timesteps, model, opt,loss)
+            train_l_tmp = gradient_step(batch_x_scale, Q, timesteps, model, opt,loss)
+            test_l_tmp = loss(model, test_x, Q_test, timesteps_test)
+
             push!(train_loss, train_l_tmp)
-
-
-            test_l_tmp = loss(model, test_x, Q_test,timesteps_test)
             push!(test_loss, test_l_tmp)
+
         end
     end
-
     return model, train_loss, test_loss, train_ids, test_ids
 
 end
 
+
 ### Example usage
 ### Replace data_matrix with samples x features matrix. 
-# trained_model, train_loss, test_loss, train_idx, test_idx = train_fold_binom(data_matrix;
-#                                                lmb=10, T=600, 
-#                                                time_choice="random", model_type="DDPM",mode="poisson",
-#                                                n_epochs=5)
-
+### See utils_DDPM.jl for possible models and losses
+#trained_model, train_loss, test_loss, train_idx, test_idx = train_fold_binom(data_matrix;
+#                                                lmb=10, t_fixed=800, 
+#                                                time_choice="random", model_type="DDPM",mode="binom",
+#                                                n_epochs=10, loss_name="huber")
 
 # The iterative denoising
 # Q: noisy data
 # T: starting timestep (integer)
 # Trained model: Trained DDPM model.
-# FIXME: this works poorly for large datasets. 
+# NOTE: this works poorly for large datasets. 
 function iter_denoise(Q, T, trained_model)
     Tim = repeat([T], size(Q)[1])
     z_t = log10.(q_sample(Q, Tim, alphas) .+1 )
